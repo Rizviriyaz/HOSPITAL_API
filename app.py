@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Response, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 import io
@@ -10,7 +10,16 @@ from torchvision.models import DenseNet121_Weights
 import torch.nn as nn
 import os
 
-app = FastAPI()
+# -----------------------------
+# ✅ FastAPI app with Swagger UI at /docs
+# -----------------------------
+app = FastAPI(
+    title="AI Chest X-ray Diagnosis API",
+    description="API for predicting chest X-ray conditions using DenseNet-121",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 LABELS = ["No Finding", "Enlarged Cardiomediastinum", "Cardiomegaly",
           "Lung Opacity", "Lung Lesion", "Edema", "Consolidation",
@@ -23,12 +32,10 @@ device = torch.device("cpu")
 # ✅ Load DenseNet model
 # -----------------------------
 def load_model(path, device):
-    # Use new torchvision API (no warnings)
-    model = models.densenet121(weights=None)  # same as pretrained=False
+    model = models.densenet121(weights=None)  # no warnings
     num_ftrs = model.classifier.in_features
     model.classifier = nn.Linear(num_ftrs, len(LABELS))
 
-    # Load fine-tuned checkpoint
     checkpoint = torch.load(path, map_location=device)
     state_dict = checkpoint.get("model_state", checkpoint)
 
@@ -58,22 +65,22 @@ transform = transforms.Compose([
 ])
 
 # -----------------------------
-# ✅ Root endpoints
+# ✅ Root redirect to Swagger UI
 # -----------------------------
-@app.get("/")
-def read_root():
-    return {"message": "Welcome! FastAPI app is running on Render 🚀"}
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
-@app.head("/")
+@app.head("/", include_in_schema=False)
 def head_root():
     return Response(status_code=200)
 
-@app.post("/")
+@app.post("/", include_in_schema=False)
 def post_root(request: Request):
     return {"error": "POST not supported on root"}
 
 # -----------------------------
-# ✅ Health check (with model test)
+# ✅ Health check (model-aware)
 # -----------------------------
 @app.get("/health", include_in_schema=False)
 def health_check():
@@ -101,7 +108,11 @@ async def predict(file: UploadFile = File(...)):
 
         results = {label: round(float(prob) * 100, 2) for label, prob in zip(LABELS, probs)}
 
-        return {"probabilities": results}
+        # Optional: add top finding
+        top_label = max(results, key=results.get)
+        top_prob = results[top_label]
+
+        return {"probabilities": results, "top_finding": {top_label: top_prob}}
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -116,4 +127,4 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    return Response(status_code=204)  # Empty response if no favicon present
+    return Response(status_code=204)  # empty response
