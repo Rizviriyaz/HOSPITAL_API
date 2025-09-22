@@ -1,42 +1,55 @@
-# app.py
-import io
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File, Response, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
+import io
 import torch
+import torchvision.transforms as transforms
+import torchvision.models as models
+from torchvision.models import DenseNet121_Weights
 import torch.nn as nn
-from torchvision import models, transforms
+import os
 
-# ----------------------------
-# Setup FastAPI
-# ----------------------------
-app = FastAPI(title="Chest X-ray Diagnosis API")
+app = FastAPI()
 
-# ----------------------------
-# Model Definition
-# ----------------------------
-num_classes = 14  # same as finetune.py (DEFAULT_LABELS length)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+LABELS = ["No Finding", "Enlarged Cardiomediastinum", "Cardiomegaly",
+          "Lung Opacity", "Lung Lesion", "Edema", "Consolidation",
+          "Pneumonia", "Atelectasis", "Pneumothorax", "Pleural Effusion",
+          "Pleural Other", "Fracture", "Support Devices"]
 
-model = models.densenet121(weights=None)
-# ✅ Match the training definition (Sequential → Linear)
-model.classifier = nn.Sequential(
-    nn.Linear(model.classifier.in_features, num_classes)
-)
+device = torch.device("cpu")
 
-# Load checkpoint (trained model)
-checkpoint = torch.load("finetuned_model.pth", map_location=device)
-# If you saved only model.state_dict()
-if "model_state" in checkpoint:
-    model.load_state_dict(checkpoint["model_state"])
-else:
-    model.load_state_dict(checkpoint)
-model.to(device)
-model.eval()
+# -----------------------------
+# ✅ Load DenseNet model
+# -----------------------------
+def load_model(path, device):
+    # Use new torchvision API (no warnings)
+    model = models.densenet121(weights=None)  # same as pretrained=False
+    num_ftrs = model.classifier.in_features
+    model.classifier = nn.Linear(num_ftrs, len(LABELS))
 
-# ----------------------------
-# Preprocessing
-# ----------------------------
+    # Load fine-tuned checkpoint
+    checkpoint = torch.load(path, map_location=device)
+    state_dict = checkpoint.get("model_state", checkpoint)
+
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("classifier.0."):
+            new_key = k.replace("classifier.0.", "classifier.")
+            new_state_dict[new_key] = v
+        elif not k.startswith("classifier."):
+            new_state_dict[k] = v
+
+    model.load_state_dict(new_state_dict, strict=False)
+    model.to(device)
+    model.eval()
+    return model
+
+model = load_model("finetuned_model.pth", device)
+
+# -----------------------------
+# ✅ Transform for input images
+# -----------------------------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -44,35 +57,63 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-LABELS = [
-    'No Finding', 'Enlarged Cardiomediastinum', 'Cardiomegaly',
-    'Lung Opacity', 'Lung Lesion', 'Edema', 'Consolidation',
-    'Pneumonia', 'Atelectasis', 'Pneumothorax',
-    'Pleural Effusion', 'Pleural Other', 'Fracture', 'Support Devices'
-]
-
-# ----------------------------
-# Routes
-# ----------------------------
+# -----------------------------
+# ✅ Root endpoints
+# -----------------------------
 @app.get("/")
-def home():
-    return {"message": "Chest X-ray Diagnosis API is running ✅"}
+def read_root():
+    return {"message": "Welcome! FastAPI app is running on Render 🚀"}
 
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
+
+@app.post("/")
+def post_root(request: Request):
+    return {"error": "POST not supported on root"}
+
+# -----------------------------
+# ✅ Health check (with model test)
+# -----------------------------
+@app.get("/health", include_in_schema=False)
+def health_check():
+    try:
+        dummy = torch.randn(1, 3, 224, 224).to(device)
+        with torch.no_grad():
+            _ = model(dummy)
+        return {"status": "ok", "model": "loaded"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "details": str(e)})
+
+# -----------------------------
+# ✅ Prediction endpoint
+# -----------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_tensor = transform(image).unsqueeze(0).to(device)
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        tensor = transform(image).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            outputs = model(img_tensor)
+            outputs = model(tensor)
             probs = torch.sigmoid(outputs).cpu().numpy()[0]
 
-        # Convert to dict {label: probability}
-        results = {LABELS[i]: float(probs[i]) for i in range(len(LABELS))}
+        results = {label: round(float(prob) * 100, 2) for label, prob in zip(LABELS, probs)}
 
-        return JSONResponse(content={"predictions": results})
+        return {"probabilities": results}
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# -----------------------------
+# ✅ Static & favicon
+# -----------------------------
+if not os.path.exists("static"):
+    os.makedirs("static")
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)  # Empty response if no favicon present
